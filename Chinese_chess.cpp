@@ -10,6 +10,8 @@
 #include<sstream>
 #include<cstdint>
 #include<random>
+#include<cassert>
+#include<unordered_map>
 
 using namespace std;
 
@@ -40,13 +42,16 @@ struct Move {
 	}
 };
 
+Move last_actual_move(-1, -1, -1, -1);
+Move last_self_move(-1, -1, -1, -1);
+
 struct TTEntry {
 	uint64_t key;
 	int depth;
 	int score;
 	int flag;
 	Move best_move;
-	int age; // 增加 age 字段，用于逻辑清理
+	int age;
 };
 
 const int TT_SIZE = 1 << 20;
@@ -65,7 +70,6 @@ int piece_to_idx(char c) {
 	}
 }
 
-// 提前声明
 void update_king_positions();
 
 void init_zobrist() {
@@ -94,7 +98,6 @@ uint64_t compute_zobrist() {
 
 void update_tt(uint64_t key, int depth, int score, int flag, Move best_move) {
 	int idx = key % TT_SIZE;
-	// 覆盖策略：如果 age 不同（说明是旧局面的）或者是更深的搜索
 	if (transposition_table[idx].age != tt_current_age || transposition_table[idx].depth <= depth) {
 		transposition_table[idx] = { key, depth, score, flag, best_move, tt_current_age };
 	}
@@ -123,36 +126,48 @@ bool query_tt(uint64_t key, int depth, int& alpha, int& beta, int& score, Move& 
 	return false;
 }
 
+// 改用哈希值记录局面，避免字符串序列化开销
 struct PositionRecord {
-	string key;
+	uint64_t hash;
 	bool moved_red;
 	bool gave_check;
-	PositionRecord(const string& k, bool mr, bool gc) : key(k), moved_red(mr), gave_check(gc) {}
+	PositionRecord(uint64_t h, bool mr, bool gc) : hash(h), moved_red(mr), gave_check(gc) {}
 };
 
 vector<Move> generate();
 void output_board(int fx, int fy, int tx, int ty);
 int find_king(bool red_side, int& kr, int& kc);
 bool attacked_by(bool attacker_red, int tr, int tc);
+bool side_gives_check(bool attacker_red);
 
 std::chrono::steady_clock::time_point end_time;
 const int INF = 100000000;
 const int MATE_SCORE = 1000000;
 
+int time_check_counter = 0;
+bool is_time_up = false;
+
 bool time_up() {
-	return std::chrono::steady_clock::now() >= end_time;
+	if (is_time_up) return true;
+	if (++time_check_counter > 128) {
+		time_check_counter = 0;
+		if (std::chrono::steady_clock::now() >= end_time) {
+			is_time_up = true;
+			return true;
+		}
+	}
+	return false;
 }
 
-//判断红黑
 void side() {
 	for (int i = 0; i < 10; i++) {
 		for (int j = 0; j < 9; j++) {
 			if (board[i][j] == 'K') {
-				is_red = true;//红方
+				is_red = true;
 				return;
 			}
 			else if (board[i][j] == 'k') {
-				is_red = false;//黑方
+				is_red = false;
 				return;
 			}
 		}
@@ -204,8 +219,11 @@ void apply_move_rc(int fr, int fc, int tr, int tc) {
 	if (fr < 0 || fr >= 10 || fc < 0 || fc >= 9 || tr < 0 || tr >= 10 || tc < 0 || tc >= 9) return;
 	board[tr][tc] = board[fr][fc];
 	board[fr][fc] = '.';
+	bool mover_is_engine = ((move_count % 2 == 0) == engine_is_red);
 	move_count++;
-	update_king_positions(); // 确保历史对局重演时，全局将帅位置是最新的
+	last_actual_move = Move(fr, fc, tr, tc);
+	if (mover_is_engine) last_self_move = Move(fr, fc, tr, tc);
+	update_king_positions();
 }
 
 void parse_moves(const string& str, const string& array_name, vector<pair<string, string>>& out_moves) {
@@ -243,25 +261,25 @@ string game_history = "";
 vector<PositionRecord> actual_position_records;
 vector<PositionRecord> search_position_records;
 
-string serialize_position(bool side_to_move_red) {
-	string s;
-	s.reserve(92);
-	for (int i = 0; i < 10; i++) {
-		for (int j = 0; j < 9; j++) s.push_back(board[i][j]);
+bool is_reverse_move(const Move& m) {
+	if (last_self_move.fx != -1) {
+		if (m.fx == last_self_move.tx && m.fy == last_self_move.ty
+			&& m.tx == last_self_move.fx && m.ty == last_self_move.fy)
+			return true;
 	}
-	s.push_back(side_to_move_red ? 'R' : 'B');
-	return s;
+	if (last_actual_move.fx == -1) return false;
+	return m.fx == last_actual_move.tx && m.fy == last_actual_move.ty
+		&& m.tx == last_actual_move.fx && m.ty == last_actual_move.fy;
 }
 
-bool side_gives_check(bool attacker_red) {
-	int kr = -1, kc = -1;
-	if (!find_king(!attacker_red, kr, kc)) return true;
-	return attacked_by(attacker_red, kr, kc);
+// 获取当前局面的哈希值（对应侧方）
+uint64_t get_position_hash() {
+	return current_zobrist_key; // 需要在每次移动后更新，此处直接用全局哈希
 }
 
 void record_historical_position(bool moved_red) {
-	bool next_side_red = (move_count % 2 == 0);
-	actual_position_records.push_back(PositionRecord(serialize_position(next_side_red), moved_red, side_gives_check(moved_red)));
+	// 注意：此时 current_zobrist_key 已经是对手要走棋的哈希（因为 make_move 后翻转了 is_red 和 key）
+	actual_position_records.emplace_back(current_zobrist_key, moved_red, side_gives_check(moved_red));
 }
 
 bool last_move_by_side_gave_check(bool moved_red) {
@@ -274,15 +292,48 @@ bool last_move_by_side_gave_check(bool moved_red) {
 	return false;
 }
 
-int count_matching_check_positions(const string& key, bool moved_red) {
+int count_matching_check_positions(uint64_t hash, bool moved_red) {
 	int cnt = 0;
 	for (size_t i = 0; i < actual_position_records.size(); i++) {
-		if (actual_position_records[i].moved_red == moved_red && actual_position_records[i].gave_check && actual_position_records[i].key == key) cnt++;
+		if (actual_position_records[i].moved_red == moved_red && actual_position_records[i].gave_check && actual_position_records[i].hash == hash) cnt++;
 	}
 	for (size_t i = 0; i < search_position_records.size(); i++) {
-		if (search_position_records[i].moved_red == moved_red && search_position_records[i].gave_check && search_position_records[i].key == key) cnt++;
+		if (search_position_records[i].moved_red == moved_red && search_position_records[i].gave_check && search_position_records[i].hash == hash) cnt++;
 	}
 	return cnt;
+}
+
+int count_consecutive_checks(bool moved_red) {
+	int cnt = 0;
+	for (int i = (int)search_position_records.size() - 1; i >= 0; i--) {
+		if (search_position_records[i].moved_red == moved_red) {
+			if (search_position_records[i].gave_check) cnt++;
+			else break;
+		}
+	}
+	bool all_search_checks = true;
+	for (size_t i = 0; i < search_position_records.size(); i++) {
+		if (search_position_records[i].moved_red == moved_red && !search_position_records[i].gave_check) {
+			all_search_checks = false;
+			break;
+		}
+	}
+	if (all_search_checks) {
+		for (int i = (int)actual_position_records.size() - 1; i >= 0; i--) {
+			if (actual_position_records[i].moved_red == moved_red) {
+				if (actual_position_records[i].gave_check) cnt++;
+				else break;
+			}
+		}
+	}
+	return cnt;
+}
+
+bool side_gives_check(bool attacker_red) {
+	int kr = attacker_red ? b_king_r : r_king_r;
+	int kc = attacker_red ? b_king_c : r_king_c;
+	if (kr == -1 || kc == -1) return true;
+	return attacked_by(attacker_red, kr, kc);
 }
 
 bool move_causes_long_check(const Move& m) {
@@ -292,17 +343,33 @@ bool move_causes_long_check(const Move& m) {
 	board[m.tx][m.ty] = old_f;
 	board[m.fx][m.fy] = '.';
 
+	int saved_rr = r_king_r, saved_rc = r_king_c;
+	int saved_br = b_king_r, saved_bc = b_king_c;
+	if (old_f == 'K') { r_king_r = m.tx; r_king_c = m.ty; }
+	if (old_f == 'k') { b_king_r = m.tx; b_king_c = m.ty; }
+
 	bool gives_check = side_gives_check(mover_red);
 	bool risky = false;
 	if (gives_check) {
-		string key = serialize_position(!mover_red);
-		int repeat_check_count = count_matching_check_positions(key, mover_red);
-		bool just_checked = last_move_by_side_gave_check(mover_red);
-		risky = (repeat_check_count >= 2) || (repeat_check_count >= 1 && just_checked);
+		// 模拟移动后，对方走棋的哈希：需要临时翻转侧方
+		uint64_t new_hash = current_zobrist_key;
+		int p_idx = piece_to_idx(old_f);
+		if (p_idx != -1) new_hash ^= zobrist_table[p_idx][m.fx][m.fy];
+		if (old_t != '.') {
+			int t_idx = piece_to_idx(old_t);
+			if (t_idx != -1) new_hash ^= zobrist_table[t_idx][m.tx][m.ty];
+		}
+		if (p_idx != -1) new_hash ^= zobrist_table[p_idx][m.tx][m.ty];
+		new_hash ^= zobrist_side; // 换手
+		int repeat_check_count = count_matching_check_positions(new_hash, mover_red);
+		int consecutive_checks = count_consecutive_checks(mover_red) + 1;
+		risky = (repeat_check_count >= 3) || (consecutive_checks >= 8);
 	}
 
 	board[m.fx][m.fy] = old_f;
 	board[m.tx][m.ty] = old_t;
+	r_king_r = saved_rr; r_king_c = saved_rc;
+	b_king_r = saved_br; b_king_c = saved_bc;
 	return risky;
 }
 
@@ -326,6 +393,8 @@ void getInputBotzone() {
 	game_history = "";
 	actual_position_records.clear();
 	search_position_records.clear();
+	last_actual_move = Move(-1, -1, -1, -1);
+	last_self_move = Move(-1, -1, -1, -1);
 
 	if (str.empty()) return;
 
@@ -342,6 +411,8 @@ void getInputBotzone() {
 				int tr = coord_to_row(reqs[i].second), tc = coord_to_col(reqs[i].second);
 				bool mover_red = (move_count % 2 == 0);
 				apply_move_rc(fr, fc, tr, tc);
+				// 更新哈希
+				current_zobrist_key = compute_zobrist();
 				record_historical_position(mover_red);
 				game_history += reqs[i].first + reqs[i].second;
 			}
@@ -350,6 +421,7 @@ void getInputBotzone() {
 				int tr = coord_to_row(resps[i].second), tc = coord_to_col(resps[i].second);
 				bool mover_red = (move_count % 2 == 0);
 				apply_move_rc(fr, fc, tr, tc);
+				current_zobrist_key = compute_zobrist();
 				record_historical_position(mover_red);
 				game_history += resps[i].first + resps[i].second;
 			}
@@ -361,16 +433,17 @@ void getInputBotzone() {
 				int tr = coord_to_row(reqs[turnID].second), tc = coord_to_col(reqs[turnID].second);
 				bool mover_red = (move_count % 2 == 0);
 				apply_move_rc(fr, fc, tr, tc);
+				current_zobrist_key = compute_zobrist();
 				record_historical_position(mover_red);
 				game_history += reqs[turnID].first + reqs[turnID].second;
 			}
 		}
 
 		is_red = (move_count % 2 == 0);
+		current_zobrist_key = compute_zobrist();
 		return;
 	}
 
-	// 兼容可能存在的单步 {"source":"..", "target":".."} 格式
 	size_t s_pos = str.find("\"source\"");
 	size_t t_pos = str.find("\"target\"");
 	if (s_pos != string::npos && t_pos != string::npos) {
@@ -379,23 +452,22 @@ void getInputBotzone() {
 			size_t q2 = str.find('"', q1 + 1);
 			if (q2 != string::npos) {
 				string s = str.substr(q1 + 1, q2 - q1 - 1);
-
 				size_t q3 = str.find('"', t_pos + 8);
 				if (q3 != string::npos) {
 					size_t q4 = str.find('"', q3 + 1);
 					if (q4 != string::npos) {
 						string t = str.substr(q3 + 1, q4 - q3 - 1);
-
 						if (s == "-1") {
 							engine_is_red = true;
 							is_red = true;
-						}
-						else {
+							current_zobrist_key = compute_zobrist();
+						} else {
 							engine_is_red = false;
 							int fr = coord_to_row(s), fc = coord_to_col(s);
 							int tr = coord_to_row(t), tc = coord_to_col(t);
 							bool mover_red = (move_count % 2 == 0);
 							apply_move_rc(fr, fc, tr, tc);
+							current_zobrist_key = compute_zobrist();
 							record_historical_position(mover_red);
 							game_history += s + t;
 							is_red = false;
@@ -445,14 +517,12 @@ int piece_safety_bonus(int value) {
 	return 4;
 }
 
-// 位置附加分表 (PST - Piece Square Tables)，以红方视角为准（黑方只需翻转行坐标）
-// 数值表示该棋子在该位置的额外奖励分，提升 AI 的走位意识
 const int PST_PAWN[10][9] = {
-	{ 0,  0,  0,  0,  0,  0,  0,  0,  0}, // 0: 底线
-	{15, 25, 35, 45, 45, 35, 25, 15, 15}, // 1: 兵临城下奖励加大
-	{15, 25, 30, 40, 40, 30, 25, 15, 15}, // 2
-	{10, 20, 25, 35, 35, 25, 20, 10, 10}, // 3
-	{ 8, 12, 18, 25, 25, 18, 12,  8,  8}, // 4: 刚过河
+	{ 0,  0,  0,  0,  0,  0,  0,  0,  0},
+	{15, 25, 35, 45, 45, 35, 25, 15, 15},
+	{15, 25, 30, 40, 40, 30, 25, 15, 15},
+	{10, 20, 25, 35, 35, 25, 20, 10, 10},
+	{ 8, 12, 18, 25, 25, 18, 12,  8,  8},
 	{ 0,  0,  0,  0,  0,  0,  0,  0,  0},
 	{ 0,  0,  0,  0,  0,  0,  0,  0,  0},
 	{ 0,  0,  0,  0,  0,  0,  0,  0,  0},
@@ -461,7 +531,7 @@ const int PST_PAWN[10][9] = {
 };
 
 const int PST_KNIGHT[10][9] = {
-	{ 0,  5, 10, 15, 15, 15, 10,  5,  0}, // 对面底线
+	{ 0,  5, 10, 15, 15, 15, 10,  5,  0},
 	{ 5, 15, 25, 25, 25, 25, 25, 15,  5},
 	{ 5, 20, 30, 35, 35, 35, 30, 20,  5},
 	{ 5, 20, 30, 40, 40, 40, 30, 20,  5},
@@ -499,30 +569,44 @@ const int PST_CANNON[10][9] = {
 	{ 0,  0,  0,  5,  5,  5,  0,  0,  0},
 };
 
-// 评估棋盘总分,红正黑负
 int evaluate() {
 	int cnt = 0;
 	int red_king_r = r_king_r, red_king_c = r_king_c;
 	int black_king_r = b_king_r, black_king_c = b_king_c;
 
-	// 统计棋子数量（用于残局判断）
+	int red_guards = 0, black_guards = 0;
+	int red_crossed_pawns = 0, black_crossed_pawns = 0;
+	int red_elephants = 0, black_elephants = 0;
 	for (int x = 0; x < 10; x++) {
 		for (int y = 0; y < 9; y++) {
-			if (board[x][y] != '.') cnt++;
+			char c = board[x][y];
+			if (c != '.') cnt++;
+			if (c == 'A') red_guards++;
+			if (c == 'a') black_guards++;
+			if (c == 'B') red_elephants++;
+			if (c == 'b') black_elephants++;
+			if (c == 'P' && x <= 4) red_crossed_pawns++;
+			if (c == 'p' && x >= 5) black_crossed_pawns++;
 		}
 	}
 
 	int score = 0;
-	bool is_endgame = cnt <= 12; // 残局判断
+	bool is_endgame = cnt <= 12;
 
-	// 统计守卫数量
-	int red_guards = 0, black_guards = 0;
-	for (int x = 0; x < 10; x++) {
-		for (int y = 0; y < 9; y++) {
-			char c = board[x][y];
-			if (c == 'A' || c == 'B') red_guards++;
-			if (c == 'a' || c == 'b') black_guards++;
+	if (red_king_c == black_king_c && red_king_c != -1) {
+		bool clear = true;
+		for (int r = black_king_r + 1; r < red_king_r; r++) {
+			if (board[r][red_king_c] != '.') { clear = false; break; }
 		}
+		if (clear) return is_red ? -(MATE_SCORE - move_count) : (MATE_SCORE - move_count);
+	}
+
+	if (red_crossed_pawns >= 2) score += (red_crossed_pawns - 1) * 20;
+	if (black_crossed_pawns >= 2) score -= (black_crossed_pawns - 1) * 20;
+
+	if (red_major_count == 0 && black_major_count == 0) {
+		score += red_crossed_pawns * 35;
+		score -= black_crossed_pawns * 35;
 	}
 
 	for (int i = 0; i < 10; i++) {
@@ -532,20 +616,15 @@ int evaluate() {
 
 			bool red_piece = is_red_piece(c);
 			int val = get_score(c);
-			
-			// 炮残局减分（由于残局炮威力下降）
 			if ((c == 'C' || c == 'c') && is_endgame) val -= 10;
 
 			int pst_val = 0;
 			int tactics_val = 0;
-			
-			// 计算攻击和防御状态（避免重复计算）
 			bool attacked = attacked_by(!red_piece, i, j);
 			bool defended = attacked_by(red_piece, i, j);
+			int knight_blocks = 0;
 
-			// 马腿阻塞惩罚
 			if (c == 'N' || c == 'n') {
-				int blocks = 0;
 				int mobility = 0;
 				int dr[8] = {-2, -2, -1, -1, 1, 1, 2, 2};
 				int dc[8] = {-1, 1, -2, 2, -2, 2, -1, 1};
@@ -558,19 +637,17 @@ int evaluate() {
 						if(br_idx >= 0 && br_idx < 10 && bc_idx >= 0 && bc_idx < 9 && board[br_idx][bc_idx] == '.') {
 							mobility++;
 						} else {
-							blocks++;
+							knight_blocks++;
 						}
 					}
 				}
-				tactics_val -= blocks * 8;
+				tactics_val -= knight_blocks * 5;
 				tactics_val += mobility * 4;
 			}
 			
-			// 沉底车奖励（控制底线）
 			if (c == 'R' && i <= 2 && j >= 3 && j <= 5) tactics_val += 25;
 			if (c == 'r' && i >= 7 && j >= 3 && j <= 5) tactics_val += 25;
 
-			// 车路通畅度
 			if (c == 'R' || c == 'r') {
 				int mobility = 0;
 				for(int d=0; d<4; d++) {
@@ -581,7 +658,6 @@ int evaluate() {
 							mobility++;
 							nr += dr4[d]; nc += dc4[d];
 						} else {
-							// 发现棋子，若是对方棋子，且受保护较弱，则有一定的压制分
 							if (is_red_piece(board[nr][nc]) != red_piece) mobility++;
 							break;
 						}
@@ -590,25 +666,22 @@ int evaluate() {
 				tactics_val += mobility * 3;
 			}
 
-			// 进攻九宫格奖励 (增强攻击性)
 			if (red_piece) {
-				// 红方棋子靠近对方九宫格
 				if (i <= 4) {
 					if (c == 'R' || c == 'C' || c == 'N') {
-						// 大子进入对方半场奖励
 						tactics_val += (4 - i) * 6;
-						// 靠近对方将位奖励
 						if (black_king_r != -1 && black_king_c != -1) {
 							int dist = abs(i - black_king_r) + abs(j - black_king_c);
 							if (dist <= 3) tactics_val += 25;
 						}
 					}
-					if (c == 'P' && i <= 2) tactics_val += 20; // 兵临城下
+					if (c == 'P') {
+						pst_val += 15;
+						if (i <= 2) pst_val += 30;
+					}
 				}
-				// 兵过河后的灵活性
 				if (c == 'P' && i <= 4) tactics_val += 10;
 			} else {
-				// 黑方棋子靠近对方九宫格
 				if (i >= 5) {
 					if (c == 'r' || c == 'c' || c == 'n') {
 						tactics_val += (i - 5) * 6;
@@ -617,12 +690,14 @@ int evaluate() {
 							if (dist <= 3) tactics_val += 25;
 						}
 					}
-					if (c == 'p' && i >= 7) tactics_val += 20;
+					if (c == 'p') {
+						pst_val += 15;
+						if (i >= 7) pst_val += 30;
+					}
 				}
 				if (c == 'p' && i >= 5) tactics_val += 10;
 			}
 
-			// 空头炮/沉底炮威胁评估与炮架质量
 			if (c == 'C' || c == 'c') {
 				int target_kr = red_piece ? black_king_r : red_king_r;
 				int target_kc = red_piece ? black_king_c : red_king_c;
@@ -632,10 +707,9 @@ int evaluate() {
 					for (int r = i + step; r != target_kr; r += step) {
 						if (board[r][j] != '.') pieces_between++;
 					}
-					if (pieces_between == 0) tactics_val += 50; // 空头炮
-					else if (pieces_between == 1) tactics_val += 25; // 有炮架
+					if (pieces_between == 0) tactics_val += 50;
+					else if (pieces_between == 1) tactics_val += 25;
 				}
-				// 炮架灵活性与炮的威慑
 				for(int d=0; d<4; d++) {
 					int dr4[4] = {-1, 1, 0, 0}, dc4[4] = {0, 0, -1, 1};
 					int nr = i + dr4[d], nc = j + dc4[d];
@@ -643,11 +717,9 @@ int evaluate() {
 					while(nr >= 0 && nr < 10 && nc >= 0 && nc < 9) {
 						if(board[nr][nc] != '.') {
 							mount_count++;
-							if(mount_count == 1) tactics_val += 4; // 发现一个炮架
+							if(mount_count == 1) tactics_val += 4;
 							if(mount_count == 2) {
-								if(is_red_piece(board[nr][nc]) != red_piece) {
-									tactics_val += 15; // 威胁对方棋子
-								}
+								if(is_red_piece(board[nr][nc]) != red_piece) tactics_val += 15;
 								break;
 							}
 						}
@@ -656,7 +728,70 @@ int evaluate() {
 				}
 			}
 
-			// 位置附加分（PST）
+			if (c == 'N' || c == 'n') {
+				int target_kr = red_piece ? black_king_r : red_king_r;
+				int target_kc = red_piece ? black_king_c : red_king_c;
+				if (target_kr != -1 && target_kc != -1) {
+					int r_diff = abs(i - target_kr);
+					int c_diff = abs(j - target_kc);
+					if ((r_diff == 1 && c_diff == 2) || (r_diff == 2 && c_diff == 1)) {
+						if ((!red_piece && target_kr >= 7 && target_kc >= 3 && target_kc <= 5) || 
+							(red_piece && target_kr <= 2 && target_kc >= 3 && target_kc <= 5)) {
+							tactics_val += 150;
+						}
+					}
+					if (r_diff == 2 && c_diff == 2) tactics_val += 200;
+				}
+				if (j == 0 || j == 8) tactics_val -= 30;
+				if (i == 4 || i == 5) tactics_val += 15;
+				int step = red_piece ? -1 : 1;
+				int nr = i + step;
+				if (nr >= 0 && nr < 10) {
+					char front_p = board[nr][j];
+					if (front_p == (red_piece ? 'c' : 'C') && knight_blocks == 0) tactics_val += 30;
+				}
+			} else if (c == 'C' || c == 'c') {
+				if (red_piece && (i == 7 && (j == 2 || j == 6))) tactics_val += 25;
+				if (!red_piece && (i == 2 && (j == 2 || j == 6))) tactics_val += 25;
+				int step = red_piece ? -1 : 1;
+				int nr = i + step;
+				if (nr >= 0 && nr < 10) {
+					char front_p = board[nr][j];
+					if (front_p == (red_piece ? 'n' : 'N')) tactics_val -= 20;
+				}
+			} else if (c == 'R' || c == 'r') {
+				int target_kr = red_piece ? black_king_r : red_king_r;
+				int target_kc = red_piece ? black_king_c : red_king_c;
+				if (target_kc != -1 && j == target_kc) {
+					int pieces_between = 0;
+					int step = (i < target_kr) ? 1 : -1;
+					for (int r = i + step; r != target_kr; r += step) {
+						if (board[r][j] != '.') pieces_between++;
+					}
+					if (pieces_between == 0) tactics_val += 60;
+				}
+				if (target_kc != -1 && target_kr != -1) {
+					if (abs(j - target_kc) == 1) {
+						bool has_guard = false;
+						for(int r = (red_piece ? 0 : 7); r <= (red_piece ? 2 : 9); r++) {
+							char p = board[r][j];
+							if (is_red_piece(p) != red_piece && (p == 'a' || p == 'A' || p == 'b' || p == 'B')) {
+								has_guard = true;
+								break;
+							}
+						}
+						if (!has_guard) {
+							for(int r = 0; r < 10; r++) {
+								if (r != i && (board[r][j] == (red_piece ? 'R' : 'r') || board[r][j] == (red_piece ? 'C' : 'c'))) {
+									tactics_val += 250;
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+
 			if (red_piece) {
 				switch (c) {
 					case 'P': pst_val = PST_PAWN[i][j]; break;
@@ -665,12 +800,9 @@ int evaluate() {
 					case 'C': pst_val = PST_CANNON[i][j]; break;
 				}
 				score += (val + pst_val + guard_bonus(c) + tactics_val);
-				
-				// 安全性评估
 				if (attacked) score -= piece_safety_penalty(val, defended);
 				else if (defended) score += piece_safety_bonus(val);
 			} else {
-				// 黑方镜像处理
 				switch (c) {
 					case 'p': pst_val = PST_PAWN[9 - i][j]; break;
 					case 'n': pst_val = PST_KNIGHT[9 - i][j]; break;
@@ -678,30 +810,26 @@ int evaluate() {
 					case 'c': pst_val = PST_CANNON[9 - i][j]; break;
 				}
 				score -= (val + pst_val + guard_bonus(c) + tactics_val);
-				
-				// 安全性评估
 				if (attacked) score += piece_safety_penalty(val, defended);
 				else if (defended) score -= piece_safety_bonus(val);
 			}
 		}
 	}
 
-	// 将帅安全评估
+	if (red_guards < 2) score -= (2 - red_guards) * 40;
+	if (black_guards < 2) score += (2 - black_guards) * 40;
+	if (red_elephants < 2) score -= (2 - red_elephants) * 20;
+	if (black_elephants < 2) score += (2 - black_elephants) * 20;
+
 	if (red_king_r != -1) {
-		if (attacked_by(false, red_king_r, red_king_c)) score -= 250; // 加大将军惩罚
-		// 缺少守卫惩罚
-		if (red_guards < 4) score -= (4 - red_guards) * 30;
-		// 将帅周围格子受攻击惩罚
+		if (attacked_by(false, red_king_r, red_king_c)) score -= 250;
 		for (int dc = -1; dc <= 1; dc++) {
 			int c = red_king_c + dc;
 			if (c >= 0 && c < 9 && attacked_by(false, red_king_r, c)) score -= 15;
 		}
 	}
-	
 	if (black_king_r != -1) {
 		if (attacked_by(true, black_king_r, black_king_c)) score += 250;
-		if (black_guards < 4) score += (4 - black_guards) * 30;
-		// 将帅周围格子受攻击奖励（对黑方不利）
 		for (int dc = -1; dc <= 1; dc++) {
 			int c = black_king_c + dc;
 			if (c >= 0 && c < 9 && attacked_by(true, black_king_r, c)) score += 15;
@@ -806,7 +934,7 @@ bool attacked_by(bool attacker_red, int tr, int tc) {
 		int sr = tr + bdr[i], sc = tc + bdc[i];
 		int er = tr + edr[i], ec = tc + edc[i];
 		if (sr < 0 || sr >= 10 || sc < 0 || sc >= 9) continue;
-		if (er < 0 || er >= 10 || ec < 0 || ec >= 9) continue; // 修复：增加象眼越界检查
+		if (er < 0 || er >= 10 || ec < 0 || ec >= 9) continue;
 		if (board[er][ec] != '.') continue;
 		if (attacker_red && sr < 5) continue;
 		if (!attacker_red && sr > 4) continue;
@@ -852,8 +980,9 @@ bool attacked_by(bool attacker_red, int tr, int tc) {
 }
 
 bool is_in_check(bool red_side) {
-	int kr = -1, kc = -1;
-	if (!find_king(red_side, kr, kc)) return true;
+	int kr = red_side ? r_king_r : b_king_r;
+	int kc = red_side ? r_king_c : b_king_c;
+	if (kr == -1 || kc == -1) return true;
 	return attacked_by(!red_side, kr, kc);
 }
 
@@ -868,12 +997,15 @@ bool move_gives_check(const Move& m) {
 	board[m.fx][m.fy] = '.';
 
 	bool opponent_red = !is_red;
-	int kr = -1, kc = -1;
+	int kr = opponent_red ? r_king_r : b_king_r;
+	int kc = opponent_red ? r_king_c : b_king_c;
+	if (old_t == 'K') { kr = -1; kc = -1; }
+	if (old_t == 'k') { kr = -1; kc = -1; }
+
 	bool gives_check = false;
-	if (find_king(opponent_red, kr, kc)) {
+	if (kr != -1 && kc != -1) {
 		gives_check = attacked_by(!opponent_red, kr, kc);
-	}
-	else {
+	} else {
 		gives_check = true;
 	}
 
@@ -884,7 +1016,6 @@ bool move_gives_check(const Move& m) {
 
 int defensive_bias(bool mover_red, bool root_context) {
 	int bias = 1;
-	// 适当降低防守偏好，鼓励反击
 	if (!engine_is_red && !mover_red && move_count <= 12) bias += 1;
 	return bias;
 }
@@ -934,13 +1065,14 @@ int move_safety_score(const Move& m, bool root_context = false) {
 
 const int MAX_PLY = 48;
 int history_table[2][10][9][10][9];
-Move killer_moves[MAX_PLY][2] = { {Move(-1, -1, -1, -1), Move(-1, -1, -1, -1)} };
+Move killer_moves[MAX_PLY][3] = { {Move(-1, -1, -1, -1), Move(-1, -1, -1, -1), Move(-1, -1, -1, -1)} };
 
 void clear_heuristics() {
 	memset(history_table, 0, sizeof(history_table));
 	for (int i = 0; i < MAX_PLY; i++) {
 		killer_moves[i][0] = Move(-1, -1, -1, -1);
 		killer_moves[i][1] = Move(-1, -1, -1, -1);
+		killer_moves[i][2] = Move(-1, -1, -1, -1);
 	}
 }
 
@@ -955,9 +1087,9 @@ int move_order_score(const Move& m, const Move* pv_move = nullptr, bool root_con
 
 	if (target != '.') {
 		score += 100000 + get_score(target) * 16 - get_score(mover);
+		score += history_table[is_red ? 1 : 0][m.fx][m.fy][m.tx][m.ty] / 2;
 	}
 	else {
-		// 杀手启发
 		if (ply < MAX_PLY) {
 			if (m.fx == killer_moves[ply][0].fx && m.fy == killer_moves[ply][0].fy && m.tx == killer_moves[ply][0].tx && m.ty == killer_moves[ply][0].ty) {
 				score += 50000;
@@ -965,22 +1097,23 @@ int move_order_score(const Move& m, const Move* pv_move = nullptr, bool root_con
 			else if (m.fx == killer_moves[ply][1].fx && m.fy == killer_moves[ply][1].fy && m.tx == killer_moves[ply][1].tx && m.ty == killer_moves[ply][1].ty) {
 				score += 40000;
 			}
+			else if (m.fx == killer_moves[ply][2].fx && m.fy == killer_moves[ply][2].fy && m.tx == killer_moves[ply][2].tx && m.ty == killer_moves[ply][2].ty) {
+				score += 30000;
+			}
 		}
-		// 历史表启发
 		score += history_table[is_red ? 1 : 0][m.fx][m.fy][m.tx][m.ty];
 	}
 
 	if (move_gives_check(m)) {
-		score += 15000; // 提高将军走法的优先级
+		score += 15000;
 	}
 	
-	// 进攻倾向排序：奖励靠近对方将帅的走法
 	int opponent_kr = is_red ? b_king_r : r_king_r;
 	int opponent_kc = is_red ? b_king_c : r_king_c;
 	if (opponent_kr != -1) {
 		int old_dist = abs(m.fx - opponent_kr) + abs(m.fy - opponent_kc);
 		int new_dist = abs(m.tx - opponent_kr) + abs(m.ty - opponent_kc);
-		if (new_dist < old_dist) score += 100; // 靠近对方将帅奖励
+		if (new_dist < old_dist) score += 100;
 	}
 
 	score += move_safety_score(m, root_context);
@@ -1005,7 +1138,7 @@ void sort_moves_by_priority(vector<Move>& moves, const Move* pv_move = nullptr, 
 }
 
 bool is_legal_move(const Move& m) {
-	update_king_positions();   // 添加：强制同步将帅位置
+	update_king_positions();
 	if (m.fx < 0 || m.fx >= 10 || m.fy < 0 || m.fy >= 9 ||
 		m.tx < 0 || m.tx >= 10 || m.ty < 0 || m.ty >= 9) return false;
 	char p = board[m.fx][m.fy];
@@ -1028,13 +1161,32 @@ bool is_legal_move(const Move& m) {
 	if (is_red) {
 		int kr = r_king_r, kc = r_king_c;
 		if (p == 'K') { kr = m.tx; kc = m.ty; }
-		if (kr == -1) illegal = true; // 防御老将丢失
+		if (kr == -1) illegal = true;
 		else illegal = attacked_by(false, kr, kc);
 	} else {
 		int kr = b_king_r, kc = b_king_c;
 		if (p == 'k') { kr = m.tx; kc = m.ty; }
 		if (kr == -1) illegal = true;
 		else illegal = attacked_by(true, kr, kc);
+	}
+
+	if (!illegal) {
+		int king_r = is_red ? r_king_r : b_king_r;
+		int king_c = is_red ? r_king_c : b_king_c;
+		if (p == 'K' || p == 'k') {
+			king_r = m.tx;
+			king_c = m.ty;
+		}
+		int opp_king_r = is_red ? b_king_r : r_king_r;
+		int opp_king_c = is_red ? b_king_c : r_king_c;
+		if (opp_king_r != -1 && king_c == opp_king_c) {
+			int step = (opp_king_r > king_r) ? 1 : -1;
+			bool clear = true;
+			for (int r = king_r + step; r != opp_king_r; r += step) {
+				if (board[r][king_c] != '.') { clear = false; break; }
+			}
+			if (clear) illegal = true;
+		}
 	}
 
 	board[m.fx][m.fy] = old_f;
@@ -1079,7 +1231,6 @@ void make_move(const Move& m, uint64_t& key) {
 	board[m.tx][m.ty] = mover;
 	board[m.fx][m.fy] = '.';
 	
-	// 更新将帅位置
 	if (mover == 'K') { r_king_r = m.tx; r_king_c = m.ty; }
 	if (mover == 'k') { b_king_r = m.tx; b_king_c = m.ty; }
 	
@@ -1090,7 +1241,6 @@ void make_move(const Move& m, uint64_t& key) {
 void unmake_move(const Move& m, char old_t, uint64_t& key) {
 	char mover = board[m.tx][m.ty];
 	
-	// 还原将帅位置
 	if (mover == 'K') { r_king_r = m.fx; r_king_c = m.fy; }
 	if (mover == 'k') { b_king_r = m.fx; b_king_c = m.fy; }
 
@@ -1099,7 +1249,6 @@ void unmake_move(const Move& m, char old_t, uint64_t& key) {
 	board[m.fx][m.fy] = mover;
 	board[m.tx][m.ty] = old_t;
 	
-	// 严格镜像撤销哈希，增加索引安全检查
 	int p_idx = piece_to_idx(mover);
 	if (p_idx != -1) key ^= zobrist_table[p_idx][m.tx][m.ty];
 	if (old_t != '.') {
@@ -1118,7 +1267,7 @@ int quiescence(int alpha, int beta, int depth_left, uint64_t& key, int ply) {
 		if (stand_pat >= beta) return beta;
 		if (alpha < stand_pat) alpha = stand_pat;
 	}
-	if (time_up() || depth_left == 0 || ply >= MAX_PLY - 4) return in_check ? evaluate() : alpha;
+	if (time_up() || depth_left <= 0 || ply >= MAX_PLY - 4) return in_check ? evaluate() : alpha;
 
 	vector<Move> moves = generate();
 	vector<Move> candidates;
@@ -1140,7 +1289,7 @@ int quiescence(int alpha, int beta, int depth_left, uint64_t& key, int ply) {
 		
 		make_move(m, key);
 		bool gives_check = side_gives_check(mover_red);
-		search_position_records.push_back(PositionRecord(serialize_position(is_red), mover_red, gives_check));
+		search_position_records.emplace_back(key, mover_red, gives_check);
 
 		int val = -quiescence(-beta, -alpha, depth_left - 1, key, ply + 1);
 
@@ -1158,9 +1307,9 @@ bool has_major_pieces(bool red_side) {
 }
 
 int minmax(int depth, int alpha, int beta, int ply, uint64_t& key, bool is_null = false) {
-	if (time_up()) return 0; // 快速退出
+	if (time_up()) return 0;
 	if (ply >= MAX_PLY - 1) return evaluate();
-	if (depth <= 0) return quiescence(alpha, beta, 6, key, ply);
+	if (depth <= 0) return quiescence(alpha, beta, 2, key, ply);
 
 	int old_alpha = alpha;
 	Move tt_move;
@@ -1171,14 +1320,40 @@ int minmax(int depth, int alpha, int beta, int ply, uint64_t& key, bool is_null 
 
 	bool in_check = is_in_check(is_red);
 
-	// 空步裁剪 (Null Move Pruning)
-	if (depth >= 3 && !in_check && !is_null && ply > 0 && has_major_pieces(is_red)) {
+	int rep_count = 0;
+	bool is_perpetual_check = false;
+	uint64_t current_hash = key;
+	for (int i = 0; i < (int)search_position_records.size(); i++) {
+		if (search_position_records[i].hash == current_hash) {
+			rep_count++;
+			if (search_position_records[i].gave_check) is_perpetual_check = true;
+		}
+	}
+	for (int i = 0; i < (int)actual_position_records.size(); i++) {
+		if (actual_position_records[i].hash == current_hash) {
+			rep_count++;
+			if (actual_position_records[i].gave_check) is_perpetual_check = true;
+		}
+	}
+	
+	if (rep_count >= 2 && ply > 0) {
+		if (is_perpetual_check) {
+			return MATE_SCORE - ply; 
+		} else if (in_check) {
+			return -MATE_SCORE + ply;
+		} else {
+			return 0;
+		}
+	}
+
+	if (depth >= 6 && !in_check && !is_null && ply > 0 && has_major_pieces(is_red)) {
+		int R = (depth > 10) ? 3 : (depth > 6) ? 2 : 1;
 		is_red = !is_red;
 		key ^= zobrist_side;
-		int null_val = -minmax(depth - 3, -beta, -beta + 1, ply + 1, key, true);
+		int null_val = -minmax(depth - 1 - R, -beta, -beta + 1, ply + 1, key, true);
 		key ^= zobrist_side;
 		is_red = !is_red;
-		if (time_up()) return 0; // 超时直接退出，不执行 evaluate 避免耗时
+		if (time_up()) return 0;
 		if (null_val >= beta) return beta;
 	}
 
@@ -1202,9 +1377,19 @@ int minmax(int depth, int alpha, int beta, int ply, uint64_t& key, bool is_null 
 		
 		make_move(m, key);
 		bool gives_check = side_gives_check(mover_red);
-		search_position_records.push_back(PositionRecord(serialize_position(is_red), mover_red, gives_check));
+		search_position_records.emplace_back(key, mover_red, gives_check);
 
-		int extension = (gives_check && ply < MAX_PLY - 2) ? 1 : 0;
+		int extension = 0;
+		if (gives_check && ply < MAX_PLY - 2 && depth > 2) {
+			if (ply == 0) {
+				extension = 1;
+			} else {
+				vector<Move> reply_moves = generate();
+				avoid_long_check_if_possible(reply_moves);
+				if (reply_moves.size() <= 1) extension = 1;
+			}
+		}
+
 		int val = -minmax(depth - 1 + extension, -beta, -alpha, ply + 1, key, false);
 
 		search_position_records.pop_back();
@@ -1215,10 +1400,14 @@ int minmax(int depth, int alpha, int beta, int ply, uint64_t& key, bool is_null 
 			best_move = m;
 			if (old_t == '.') {
 				history_table[is_red ? 1 : 0][m.fx][m.fy][m.tx][m.ty] += depth * depth;
-				if (ply < MAX_PLY && !(killer_moves[ply][0] == m)) {
+				if (ply < MAX_PLY && !(killer_moves[ply][0] == m) && !(killer_moves[ply][1] == m) && !(killer_moves[ply][2] == m)) {
+					killer_moves[ply][2] = killer_moves[ply][1];
 					killer_moves[ply][1] = killer_moves[ply][0];
 					killer_moves[ply][0] = m;
 				}
+			}
+			else {
+				history_table[is_red ? 1 : 0][m.fx][m.fy][m.tx][m.ty] += depth;
 			}
 		}
 		if (val > alpha) alpha = val;
@@ -1237,50 +1426,41 @@ int minmax(int depth, int alpha, int beta, int ply, uint64_t& key, bool is_null 
 
 string query_opening_book(const string& history, bool is_red) {
 	map<string, string> book;
-	// 网战常见开局：中炮局 (h2e2)
-	book[""] = "h2e2"; // 默认起手中炮 (炮二平五)
-	
-	// --- 红方视角：中炮对屏风马 ---
-	book["h2e2h9g7"] = "h0g2"; // 对马8进7，我马八进七
-	book["h2e2h9g7h0g2i9h9"] = "i0h0"; // 对车9平8，我车九平八
-	book["h2e2h9g7h0g2i9h9i0h0b9c7"] = "g3g4"; // 对马2进3，我兵七进一 (挺兵制马)
-	book["h2e2h9g7h0g2i9h9i0h0b9c7g3g4a9a8"] = "h0h6"; // 对车1进1，我车八进六 (巡河车)
-
-	// --- 黑方视角：应对中炮 (h2e2) ---
-	book["h2e2"] = "h9g7"; // 对炮二平五，我马8进7 (屏风马)
-	book["h2e2h0g2"] = "i9h9"; // 对马八进七，我车9平8
-	book["h2e2h0g2i9h9i0h0"] = "b9c7"; // 对车九平八，我马2进3 (形成屏风马)
-	book["h2e2h0g2i9h9i0h0b9c7g3g4"] = "c6c5"; // 对兵七进一，我卒3进1
-	book["h2e2h0g2i9h9i0h0b9c7g3g4c6c5h0h6"] = "b7b6"; // 对车八进六，我炮2退1 (平炮兑车准备)
-
-	// --- 黑方视角：应对顺炮 (h2e2 h7e7) ---
-	book["h2e2h7e7"] = "h0g2"; // 红马八进七
-	book["h2e2h7e7h0g2"] = "h9g7"; // 黑马8进7
-	book["h2e2h7e7h0g2h9g7"] = "i0h0"; // 红车九平八
-
-	// --- 黑方视角：应对仙人指路 (g3g4) ---
-	book["g3g4"] = "c6c5"; // 卒底炮 (对挺兵)
-	book["g3g4c6c5"] = "h0g2"; // 红马八进七
-	book["g3g4c6c5h0g2"] = "h9g7"; // 黑马8进7
-	book["g3g4c6c5h0g2h9g7"] = "b2d2"; // 红炮八平六
-	
-	// --- 黑方视角：应对飞相局 (c0e2) ---
-	book["c0e2"] = "h7e7"; // 应对飞相，黑左中炮
-	book["c0e2h7e7"] = "h0g2"; // 红马八进七
-	book["c0e2h7e7h0g2"] = "h9g7"; // 黑马8进7
-
-	if (book.count(history)) {
-		return book[history];
-	}
+	book[""] = "h2e2";
+	book["h2e2h9g7"] = "h0g2";
+	book["h2e2h9g7h0g2i9h9"] = "i0h0";
+	book["h2e2h9g7h0g2i9h9i0h0b9c7"] = "g3g4";
+	book["h2e2h9g7h0g2i9h9i0h0b9c7g3g4a9a8"] = "h0h6";
+	book["h2e2"] = "h9g7";
+	book["h2e2h0g2"] = "i9h9";
+	book["h2e2h0g2i9h9i0h0"] = "b9c7";
+	book["h2e2h0g2i9h9i0h0b9c7g3g4"] = "c6c5";
+	book["h2e2h0g2i9h9i0h0b9c7g3g4c6c5h0h6"] = "b7b6";
+	book["h2e2h7e7"] = "h0g2";
+	book["h2e2h7e7h0g2"] = "h9g7";
+	book["h2e2h7e7h0g2h9g7"] = "i0h0";
+	book["g3g4"] = "c6c5";
+	book["g3g4c6c5"] = "h0g2";
+	book["g3g4c6c5h0g2"] = "h9g7";
+	book["g3g4c6c5h0g2h9g7"] = "b2d2";
+	book["c0e2"] = "h7e7";
+	book["c0e2h7e7"] = "h0g2";
+	book["c0e2h7e7h0g2"] = "h9g7";
+	book["c0e2b9c7"] = "h0g2";
+	book["b0c2"] = "b9c7";
+	book["b0c2b9c7"] = "c3c4";
+	book["b0c2c6c5"] = "g3g4";
+	book["h0g2"] = "b9c7";
+	book["h0g2h9g7"] = "i0h0";
+	if (book.count(history)) return book[history];
 	return "";
 }
 
-// 最终AI：搜索
 void ai() {
 	current_zobrist_key = compute_zobrist();
-	update_major_counts(); // 初始化大子计数器
-	update_king_positions(); // 初始化将帅位置
-	tt_current_age++;      // 逻辑清理置换表
+	update_major_counts();
+	update_king_positions();
+	tt_current_age += 3;
 
 	string book_move = query_opening_book(game_history, is_red);
 	if (!book_move.empty()) {
@@ -1289,7 +1469,6 @@ void ai() {
 		int tr = coord_to_row(book_move.substr(2, 2));
 		int tc = coord_to_col(book_move.substr(2, 2));
 
-		// 校验开局库走法是否合法（安全兜底）
 		vector<Move> moves = generate();
 		bool valid = false;
 		for (size_t i = 0; i < moves.size(); i++) {
@@ -1303,39 +1482,101 @@ void ai() {
 		}
 	}
 
-	// 动态时间管理：根据对局阶段分配时间，增加安全冗余
-	int time_limit = 700;
-	if (move_count > 40) time_limit = 850; // 残局留出更多冗余
-	if (move_count < 10) time_limit = 500; 
+	int time_limit = 650; // 基础 650ms，为平台留足余量
+	vector<Move> initial_moves = generate();
+	int move_count_this_turn = initial_moves.size();
+	time_limit = min(750, 450 + move_count_this_turn * 3);
+	if (initial_moves.size() < 10 || move_count > 40 || (red_major_count + black_major_count) <= 6) {
+		time_limit = max(time_limit, 800);
+	}
+	if (time_limit > 850) time_limit = 850; // 绝对不超过平台极限
 
 	end_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(time_limit);
+	is_time_up = false;
+	time_check_counter = 0;
 	Move best_move(0, 0, 0, 0);
 	bool has_best = false;
 	clear_heuristics();
-	// 移除 memset，改用 age 机制
 
-	for (int depth = 1; depth <= 16; depth++) { // 提高上限，靠时间退出
+	int max_depth = (move_count > 40) ? 12 : 16;
+	for (int depth = 1; depth <= max_depth; depth++) {
 		if (time_up()) break;
-		
 		int alpha = -INF, beta = INF;
 		uint64_t key_copy = current_zobrist_key;
-		minmax(depth, alpha, beta, 0, key_copy);
-
+		int current_score = minmax(depth, alpha, beta, 0, key_copy);
 		if (!time_up()) {
 			int idx = current_zobrist_key % TT_SIZE;
 			if (transposition_table[idx].key == current_zobrist_key) {
 				best_move = transposition_table[idx].best_move;
 				has_best = true;
 			}
+			if (depth >= 10 && current_score > 5000) break;
+			if (depth >= 8) {
+				auto now = std::chrono::steady_clock::now();
+				auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now).count();
+				if (duration < 100) break;
+			}
+		}
+	}
+
+	if (has_best) {
+		if (!is_legal_move(best_move)) {
+			has_best = false;
+		} else if (move_causes_long_check(best_move)) {
+			Move safe_move;
+			bool found_safe = false;
+			vector<Move> moves = generate();
+			for (size_t i = 0; i < moves.size(); i++) {
+				if (!move_causes_long_check(moves[i])) {
+					safe_move = moves[i];
+					found_safe = true;
+					break;
+				}
+			}
+			if (found_safe) {
+				best_move = safe_move;
+			} else {
+				has_best = false;
+			}
+		} else if (is_reverse_move(best_move)) {
+			Move alt_move;
+			bool found_alt = false;
+			vector<Move> moves = generate();
+			for (size_t i = 0; i < moves.size(); i++) {
+				if (!is_reverse_move(moves[i]) && !move_causes_long_check(moves[i])) {
+					alt_move = moves[i];
+					found_alt = true;
+					break;
+				}
+			}
+			if (found_alt) {
+				best_move = alt_move;
+			} else {
+				has_best = false;
+			}
 		}
 	}
 
 	if (!has_best) {
 		vector<Move> moves = generate();
-		if (moves.empty()) {
-			output_board(-1, -1, -1, -1);
+		bool found_legal = false;
+		for (size_t i = 0; i < moves.size(); i++) {
+			if (is_legal_move(moves[i]) && !move_causes_long_check(moves[i]) && !is_reverse_move(moves[i])) {
+				output_board(moves[i].fx, moves[i].fy, moves[i].tx, moves[i].ty);
+				found_legal = true;
+				break;
+			}
 		}
-		else output_board(moves[0].fx, moves[0].fy, moves[0].tx, moves[0].ty);
+		if (!found_legal) {
+			for (size_t i = 0; i < moves.size(); i++) {
+				if (is_legal_move(moves[i]) && !move_causes_long_check(moves[i])) {
+					output_board(moves[i].fx, moves[i].fy, moves[i].tx, moves[i].ty);
+					found_legal = true;
+					break;
+				}
+			}
+		}
+		if (!found_legal) output_board(-1, -1, -1, -1);
 		return;
 	}
 
@@ -1352,7 +1593,6 @@ vector<Move> generate() {
 			if (is_red && !(ch >= 'A' && ch <= 'Z'))continue;
 			if (!is_red && !(ch >= 'a' && ch <= 'z'))continue;
 
-			//車R/r
 			if (ch == 'R' || ch == 'r') {
 				int dx[] = { -1 ,1,0,0 };
 				int dy[] = { 0,0,-1,1 };
@@ -1379,7 +1619,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//马N/n
 			else if (ch == 'N' || ch == 'n') {
 				int dx[] = { -2,-2,-1,-1,1,1,2,2 };
 				int dy[] = { -1,1,-2,2,-2,2,-1,1 };
@@ -1391,7 +1630,7 @@ vector<Move> generate() {
 					int bx2 = x + bx[d], by2 = y + by[d];
 
 					if (xx < 0 || xx >= 10 || yy < 0 || yy >= 9)continue;
-					if (bx2 < 0 || bx2 >= 10 || by2 < 0 || by2 >= 9) continue; // 防御：检查马腿坐标越界
+					if (bx2 < 0 || bx2 >= 10 || by2 < 0 || by2 >= 9) continue;
 					if (board[bx2][by2] != '.')continue;
 
 					char tar = board[xx][yy];
@@ -1401,7 +1640,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//炮C/c
 			else if (ch == 'C' || ch == 'c') {
 				int dx[] = { -1,1,0,0 };
 				int dy[] = { 0,0,-1,1 };
@@ -1431,7 +1669,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//士A/a
 			else if (ch == 'A' || ch == 'a') {
 				int dx[] = { -1,-1,1,1 };
 				int dy[] = { -1,1,-1,1 };
@@ -1447,7 +1684,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//象B/b
 			else if (ch == 'B' || ch == 'b') {
 				int dx[] = { -2,-2,2,2 };
 				int dy[] = { -2,2,-2,2 };
@@ -1459,7 +1695,7 @@ vector<Move> generate() {
 					int xx = x + dx[d], yy = y + dy[d];
 					int bx2 = x + bx[d], by2 = y + by[d];
 					if (xx < 0 || xx >= 10 || yy < 0 || yy >= 9) continue;
-					if (bx2 < 0 || bx2 >= 10 || by2 < 0 || by2 >= 9) continue; // 防御：检查象眼坐标越界
+					if (bx2 < 0 || bx2 >= 10 || by2 < 0 || by2 >= 9) continue;
 					if ((is_red && xx < line) || (!is_red && xx >= line)) continue;
 					if (board[bx2][by2] != '.') continue;
 
@@ -1469,7 +1705,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//帅K/k
 			else if (ch == 'K' || ch == 'k') {
 				int dx[] = { -1,1,0,0 };
 				int dy[] = { 0,0,-1,1 };
@@ -1485,7 +1720,6 @@ vector<Move> generate() {
 				}
 			}
 
-			//兵P/p
 			else if (ch == 'P' || ch == 'p') {
 				int dx[3], dy[3];
 				int cnt = 0;
@@ -1535,7 +1769,13 @@ void output_board(int fx, int fy, int tx, int ty) {
 		cout << "{\"response\":{\"source\":\"-1\",\"target\":\"-1\"}}" << endl;
 	}
 	else {
-		cout << "{\"response\":{\"source\":\"" << rowcol_to_coord(fx, fy) << "\",\"target\":\"" << rowcol_to_coord(tx, ty) << "\"}}" << endl;
+		Move m(fx, fy, tx, ty);
+		if (!is_legal_move(m)) {
+			cerr << "ERROR: illegal move output -1" << endl;
+			cout << "{\"response\":{\"source\":\"-1\",\"target\":\"-1\"}}" << endl;
+		} else {
+			cout << "{\"response\":{\"source\":\"" << rowcol_to_coord(fx, fy) << "\",\"target\":\"" << rowcol_to_coord(tx, ty) << "\"}}" << endl;
+		}
 	}
 }
 
